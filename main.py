@@ -1,32 +1,115 @@
 """
 Wiktionary Lookup
-A standalone word-definition app: type a word, see its full definitions
-(part of speech, numbered senses, examples, related words) in a panel
-that scrolls and wraps instead of clipping, plus a second tab with the
-real Wiktionary page embedded for anything the structured API doesn't
-cover (pronunciation audio, etymology, etc).
+A standalone word-definition app styled after compact "quick lookup" tools:
+each definition, example, synonym set, and antonym set is its own row with
+an icon and a type badge, and rows wrap to fit their full content instead
+of clipping. A second tab embeds the real Wiktionary page for anything the
+structured data doesn't cover (pronunciation audio, etymology, etc).
 
 Run with:  python main.py
 """
 
+import os
 import sys
 import json
-from urllib.parse import quote, unquote, urlparse
+from pathlib import Path
+from urllib.parse import quote, unquote
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QPushButton, QTabWidget, QTextBrowser, QLabel, QCompleter
+    QLineEdit, QPushButton, QTabWidget, QListWidget, QListWidgetItem,
+    QLabel, QCompleter
 )
-from PySide6.QtCore import Qt, QUrl, QStringListModel
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import Qt, QUrl, QStringListModel, QTimer
+from PySide6.QtGui import QAction, QKeySequence, QIcon
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-API_URL = "https://en.wiktionary.org/api/rest_v1/page/definition/{}"
+API_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/{}"
 PAGE_URL = "https://en.wiktionary.org/wiki/{}"
 
-HISTORY_PATH = "history.json"
 MAX_HISTORY = 50
+
+# visual style per row "kind"
+KIND_STYLE = {
+    "definition": {"icon": "Aa", "color": "#89b4fa"},
+    "example":    {"icon": "\u275d",  "color": "#a6adc8"},   # ❝
+    "synonyms":   {"icon": "\u2194",  "color": "#a6e3a1"},   # ↔
+    "antonyms":   {"icon": "\u21c4",  "color": "#f38ba8"},   # ⇄
+}
+
+
+def resource_path(relative_path):
+    """Resolve a bundled resource whether running from source or from a
+    PyInstaller --onefile exe (which unpacks assets into a temp folder)."""
+    base_path = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+def get_app_data_dir():
+    """A per-user, always-writable folder -- works whether the exe lives in
+    Program Files, Downloads, or anywhere else that might be read-only."""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    app_dir = Path(base) / "WiktionaryLookup"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir
+
+
+HISTORY_PATH = get_app_data_dir() / "history.json"
+
+
+class ResultRow(QWidget):
+    """One row: an icon, a line of rich text that wraps freely, and a badge."""
+
+    def __init__(self, kind, label_html, badge_text, on_word_link=None):
+        super().__init__()
+        style = KIND_STYLE.get(kind, KIND_STYLE["definition"])
+        color = style["color"]
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(10)
+
+        icon = QLabel(style["icon"])
+        icon.setFixedSize(28, 28)
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setStyleSheet(
+            f"background-color: {color}2A; color: {color}; border-radius: 14px; "
+            f"font-weight: 600; font-size: 13px;"
+        )
+        layout.addWidget(icon, 0, Qt.AlignTop)
+
+        text = QLabel(label_html)
+        text.setTextFormat(Qt.RichText)
+        text.setWordWrap(True)
+        text.setOpenExternalLinks(False)
+        text.setStyleSheet("font-size: 13px; color: #cdd6f4;")
+        if on_word_link:
+            text.linkActivated.connect(on_word_link)
+        layout.addWidget(text, 1)
+
+        badge = QLabel(badge_text)
+        badge.setStyleSheet(
+            f"background-color: {color}22; color: {color}; border: 1px solid {color}66; "
+            f"border-radius: 9px; padding: 2px 10px; font-size: 11px;"
+        )
+        badge.setAlignment(Qt.AlignCenter)
+        layout.addWidget(badge, 0, Qt.AlignTop)
+
+
+class ResultsList(QListWidget):
+    """A QListWidget whose rows re-wrap (and grow taller) when the window
+    is resized, instead of clipping their content."""
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        width = self.viewport().width()
+        for i in range(self.count()):
+            item = self.item(i)
+            widget = self.itemWidget(item)
+            if widget:
+                widget.setFixedWidth(width)
+                item.setSizeHint(widget.sizeHint())
 
 
 class DictionaryWindow(QMainWindow):
@@ -34,9 +117,16 @@ class DictionaryWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Wiktionary Lookup")
         self.resize(760, 560)
+        icon_path = resource_path("icon.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         self.nam = QNetworkAccessManager(self)
         self.history = self._load_history()
+
+        self.debounce_timer = QTimer(self)
+        self.debounce_timer.setSingleShot(True)
+        self.debounce_timer.timeout.connect(self.on_search)
 
         self._build_ui()
         self.search_input.setFocus()
@@ -53,7 +143,8 @@ class DictionaryWindow(QMainWindow):
         search_row = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Type a word and press Enter…")
-        self.search_input.returnPressed.connect(self.on_search)
+        self.search_input.returnPressed.connect(self._search_now)
+        self.search_input.textChanged.connect(self._on_text_changed)
         self.completer_model = QStringListModel(self.history)
         completer = QCompleter(self.completer_model, self)
         completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -66,23 +157,27 @@ class DictionaryWindow(QMainWindow):
         search_row.addWidget(search_btn)
         layout.addLayout(search_row)
 
-        # -- status line ---------------------------------------------------
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #888;")
-        layout.addWidget(self.status_label)
-
         # -- tabs: rendered definition / live wiktionary page ------------
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
 
-        self.definition_view = QTextBrowser()
-        self.definition_view.setOpenLinks(False)  # intercept, don't navigate away
-        self.definition_view.anchorClicked.connect(self.on_definition_link_clicked)
-        self.definition_view.setStyleSheet("font-size: 14px;")
-        self.tabs.addTab(self.definition_view, "Definition")
+        self.results_list = ResultsList()
+        self.results_list.setStyleSheet("""
+            QListWidget { background-color: #1e1e2e; border: none; }
+            QListWidget::item { border-bottom: 1px solid #313244; }
+            QListWidget::item:selected { background-color: transparent; }
+        """)
+        self.results_list.setSelectionMode(QListWidget.NoSelection)
+        self.results_list.setFocusPolicy(Qt.NoFocus)
+        self.tabs.addTab(self.results_list, "Definition")
 
         self.web_view = QWebEngineView()
         self.tabs.addTab(self.web_view, "Wiktionary Page")
+
+        # -- status line ---------------------------------------------------
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #7f849c; font-size: 12px;")
+        layout.addWidget(self.status_label)
 
         self._show_placeholder()
 
@@ -93,9 +188,7 @@ class DictionaryWindow(QMainWindow):
         self.addAction(focus_action)
 
     def _show_placeholder(self):
-        self.definition_view.setHtml(
-            "<p style='color:#888;'>Search for a word to see its definition here.</p>"
-        )
+        self._set_rows([("definition", "<span style='color:#7f849c;'>Search for a word to see its definition here.</span>", "")])
 
     # ------------------------------------------------------------- history
     def _load_history(self):
@@ -121,27 +214,40 @@ class DictionaryWindow(QMainWindow):
         self._save_history()
 
     # -------------------------------------------------------------- search
+    def _on_text_changed(self, text):
+        text = text.strip()
+        if not text:
+            self.debounce_timer.stop()
+            self._show_placeholder()
+            self.status_label.setText("")
+            return
+        self.debounce_timer.start(400)  # wait for a pause in typing
+
+    def _search_now(self):
+        self.debounce_timer.stop()
+        self.on_search()
+
     def on_search(self):
         word = self.search_input.text().strip()
         if word:
             self.do_search(word)
 
-    def on_definition_link_clicked(self, url: QUrl):
-        """A word inside a definition was clicked -- look it up instead of navigating away."""
-        path = url.path()  # e.g. /wiki/example
-        candidate = unquote(path.rsplit("/", 1)[-1]) if path else ""
-        if candidate:
-            self.search_input.setText(candidate)
-            self.do_search(candidate)
+    def on_word_link_clicked(self, href):
+        word = unquote(href)
+        if word:
+            self.search_input.blockSignals(True)
+            self.search_input.setText(word)
+            self.search_input.blockSignals(False)
+            self.debounce_timer.stop()
+            self.do_search(word)
 
     def do_search(self, word):
         self.status_label.setText(f"Looking up “{word}”…")
-        self.definition_view.setHtml("<p style='color:#888;'>Loading…</p>")
+        self._set_rows([("definition", "<span style='color:#7f849c;'>Loading…</span>", "")])
 
         # load the real page in the second tab straight away
         self.web_view.load(QUrl(PAGE_URL.format(quote(word))))
 
-        # fetch structured definition data
         req = QNetworkRequest(QUrl(API_URL.format(quote(word))))
         reply = self.nam.get(req)
         reply.finished.connect(lambda: self._handle_reply(reply, word))
@@ -152,12 +258,13 @@ class DictionaryWindow(QMainWindow):
 
         if reply.error() != QNetworkReply.NoError or status == 404:
             self.status_label.setText(f"No entry found for “{word}”.")
-            self.definition_view.setHtml(
-                f"<h2>{word}</h2>"
-                f"<p style='color:#888;'>No definition found. "
-                f"Check the <b>Wiktionary Page</b> tab — it may still have relevant "
-                f"content (alternate spelling, redirect, etc).</p>"
-            )
+            self._set_rows([(
+                "definition",
+                f"<b>{word}</b> &nbsp; <span style='color:#7f849c;'>"
+                f"No definition found. Check the <b>Wiktionary Page</b> tab — "
+                f"it may still have relevant content.</span>",
+                ""
+            )])
             self._remember(word)
             return
 
@@ -167,43 +274,110 @@ class DictionaryWindow(QMainWindow):
             self.status_label.setText(f"Could not parse response for “{word}”.")
             return
 
-        self.status_label.setText(f"Showing results for “{word}”.")
-        self.definition_view.setHtml(self._render_html(data, word))
+        rows = self._build_rows(data, word)
+        self._set_rows(rows)
+        self.status_label.setText(f"“{word}” — {len(rows)} results")
         self._remember(word)
 
-    # -------------------------------------------------------------- render
-    def _render_html(self, data: dict, word: str) -> str:
-        entries = data.get("en") or (next(iter(data.values())) if data else [])
-        if not entries:
-            return f"<h2>{word}</h2><p style='color:#888;'>No English entry found.</p>"
+    # ---------------------------------------------------------- row building
+    def _build_rows(self, data, word):
+        """Returns a list of (kind, label_html, badge_text) tuples, mirroring
+        the compact row-per-fact style: a row per definition, a row per
+        example, and one merged row each for synonyms/antonyms per part
+        of speech."""
+        if not isinstance(data, list) or not data:
+            return [("definition", f"<b>{word}</b> &nbsp; <span style='color:#7f849c;'>No entries found.</span>", "")]
 
-        html = [f"<h2>{word}</h2>"]
-        for entry in entries:
-            pos = entry.get("partOfSpeech", "")
-            html.append(f"<h3 style='margin-bottom:2px;'>{pos}</h3>")
-            html.append("<ol style='margin-top:4px;'>")
-            for d in entry.get("definitions", []):
-                definition_text = d.get("definition", "")
-                html.append(f"<li style='margin-bottom:10px;'>{definition_text}")
+        entry = data[0]
+        phonetic = entry.get("phonetic") or ""
+        if not phonetic:
+            for p in entry.get("phonetics", []):
+                if p.get("text"):
+                    phonetic = p["text"]
+                    break
 
-                for ex in d.get("parsedExamples") or []:
-                    ex_text = ex.get("example") if isinstance(ex, dict) else ex
-                    if ex_text:
-                        html.append(f"<br><span style='color:#888;'><i>e.g. {ex_text}</i></span>")
+        rows = []
+        for meaning in entry.get("meanings", []):
+            pos = meaning.get("partOfSpeech", "")
+            pos_label = pos.capitalize() if pos else "Word"
 
-                for rel in d.get("relatedWords") or []:
-                    rtype = (rel.get("relationshipType") or "").capitalize()
-                    words = ", ".join(rel.get("words", []))
-                    if words:
-                        html.append(f"<br><b>{rtype}s:</b> {words}")
+            all_synonyms, all_antonyms = [], []
+            for m_syn in meaning.get("synonyms", []):
+                if m_syn not in all_synonyms:
+                    all_synonyms.append(m_syn)
+            for m_ant in meaning.get("antonyms", []):
+                if m_ant not in all_antonyms:
+                    all_antonyms.append(m_ant)
 
-                html.append("</li>")
-            html.append("</ol>")
-        return "".join(html)
+            for defn in meaning.get("definitions", []):
+                header = f"<b>{word}</b>"
+                if phonetic:
+                    header += f" <span style='color:#7f849c;'>{phonetic}</span>"
+                header += f" <span style='color:#7f849c;'>({pos})</span>"
+                rows.append((
+                    "definition",
+                    f"{header} &nbsp;&nbsp; {defn.get('definition', '')}",
+                    pos_label,
+                ))
+
+                if defn.get("example"):
+                    rows.append((
+                        "example",
+                        f"<b>Example ({pos})</b> &nbsp;&nbsp; \u201c{defn['example']}\u201d",
+                        "example",
+                    ))
+
+                for s in defn.get("synonyms", []):
+                    if s not in all_synonyms:
+                        all_synonyms.append(s)
+                for a in defn.get("antonyms", []):
+                    if a not in all_antonyms:
+                        all_antonyms.append(a)
+
+            if all_synonyms:
+                links = ", ".join(
+                    f"<a href='{quote(w)}' style='color:#a6e3a1; text-decoration:none;'>{w}</a>"
+                    for w in all_synonyms
+                )
+                rows.append((
+                    "synonyms",
+                    f"<b>Synonyms ({pos})</b> &nbsp;&nbsp; {links}",
+                    "synonyms",
+                ))
+
+            if all_antonyms:
+                links = ", ".join(
+                    f"<a href='{quote(w)}' style='color:#f38ba8; text-decoration:none;'>{w}</a>"
+                    for w in all_antonyms
+                )
+                rows.append((
+                    "antonyms",
+                    f"<b>Antonyms ({pos})</b> &nbsp;&nbsp; {links}",
+                    "antonyms",
+                ))
+
+        if not rows:
+            rows = [("definition", f"<b>{word}</b> &nbsp; <span style='color:#7f849c;'>No definitions found.</span>", "")]
+        return rows
+
+    def _set_rows(self, rows):
+        self.results_list.clear()
+        width = self.results_list.viewport().width()
+        for kind, label_html, badge_text in rows:
+            item = QListWidgetItem()
+            widget = ResultRow(kind, label_html, badge_text, on_word_link=self.on_word_link_clicked)
+            if width > 0:
+                widget.setFixedWidth(width)
+            item.setSizeHint(widget.sizeHint())
+            self.results_list.addItem(item)
+            self.results_list.setItemWidget(item, widget)
 
 
 def main():
     app = QApplication(sys.argv)
+    icon_path = resource_path("icon.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     window = DictionaryWindow()
     window.show()
     sys.exit(app.exec())

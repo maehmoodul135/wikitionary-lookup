@@ -27,7 +27,7 @@ pip install pyinstaller
 
 echo.
 echo Building WiktionaryLookup.exe ...
-pyinstaller --noconsole --onefile --name WiktionaryLookup main.py
+pyinstaller --noconsole --onefile --name WiktionaryLookup --icon=icon.ico --add-data "icon.ico;." main.py
 
 echo.
 if exist dist\WiktionaryLookup.exe (

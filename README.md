@@ -7,16 +7,16 @@ definitions that scroll and wrap properly instead of getting clipped.
 ## What it does
 
 - Type a word, press Enter (or click Search).
-- **Definition** tab: numbered senses grouped by part of speech, with usage
-  examples and related words, pulled from Wiktionary's structured API and
-  rendered in a scrolling panel — no truncation, however long the entry is.
-- **Wiktionary Page** tab: the actual `en.wiktionary.org` page for that word,
-  embedded in the app — covers pronunciation audio, etymology, and anything
-  else the structured data doesn't include.
-- Click any linked word inside a definition to look *that* word up instead
-  of leaving the app.
+- **Definition** tab: a compact row per fact — one row for each sense
+  (with part-of-speech badge), one row for each usage example, and one
+  merged row each for synonyms and antonyms per part of speech. Rows wrap
+  and grow to fit their full content — nothing gets clipped, however long
+  the definition is. Click a synonym or antonym to look that word up too.
+- **Wiktionary Page** tab: the actual `en.wiktionary.org` page for that
+  word, embedded in the app — covers pronunciation audio, etymology, and
+  anything else the structured data doesn't include.
 - Remembers your recent searches for autocomplete (stored in `history.json`
-  next to the script).
+  in a per-user app-data folder, so it works no matter where the exe lives).
 - `Ctrl+L` jumps focus to the search box from anywhere in the window.
 
 ## Setup
@@ -39,13 +39,14 @@ initializes — that's normal.
 
 ## Notes on the data
 
-- Definitions, examples, and related words come from Wiktionary's public
-  REST API (`/api/rest_v1/page/definition/`). Coverage of synonyms/antonyms
-  varies by word — some entries have them, some don't — since that depends
-  on how thoroughly the word's page has been edited. When they're missing
-  from the Definition tab, the Wiktionary Page tab will still show whatever
-  exists on the source page (e.g. under "Synonyms" as a Wikitext section
-  the API doesn't structure).
+- Definitions, phonetics, examples, synonyms, and antonyms come from the
+  [Free Dictionary API](https://dictionaryapi.dev) (`api.dictionaryapi.dev`),
+  which is itself built on Wiktionary content — this gives structured
+  synonyms/antonyms per sense reliably, unlike Wiktionary's own raw API.
+  Coverage still varies by word (some entries have fuller data than others,
+  since it depends on how thoroughly that word's Wiktionary page has been
+  edited). When something's missing from the Definition tab, the Wiktionary
+  Page tab shows the full original source page as a fallback.
 - Requires an internet connection.
 
 ## Packaging as a standalone .exe
@@ -69,6 +70,26 @@ or local Python setup required on your end.
 
 Either way, Qt WebEngine adds noticeably to the build size (~150–200 MB)
 since it bundles a Chromium runtime — that's expected.
+
+## Where to put the exe
+
+You don't need `Program Files` for this to work like a "real" app — that
+folder is Windows-protected and requires admin rights to write to, which
+can cause headaches for portable single-file exes like this one (the app
+now stores its search history in `%LOCALAPPDATA%\WiktionaryLookup\` instead
+of next to the exe, specifically so it works fine no matter where the exe
+lives). A simple, low-friction setup:
+
+1. Create a folder like `C:\Apps\WiktionaryLookup\` and put `WiktionaryLookup.exe` there.
+2. Right-click the exe → **Show more options** → **Create shortcut**.
+3. Move that shortcut into your Start Menu folder (`Win+R`, type
+   `shell:programs`, hit Enter, drop the shortcut in there) so it shows up
+   when you search the Start Menu.
+4. Right-click the Start Menu entry → **Pin to taskbar**, if you want it there too.
+
+If you'd still rather use `Program Files`, it works the same way — just
+expect a UAC ("do you want to allow this app...") prompt when you copy
+files into it, since that folder needs admin approval to write to.
 
 ## Running it at startup (optional)
 
